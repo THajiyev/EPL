@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="The longest loops of Premier League results where each team beat the next and the last team beat the first, for every season since 1992–93.">
+  <title>Circle of Victory</title>
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="./style.css">
+  <script src="./teams.js" defer></script>
+  <script src="./matches.js" defer></script>
+  <script src="./crests.js" defer></script>
+  <script src="./format.js" defer></script>
+  <script src="./ring.js" defer></script>
+  <script src="./snapshot.js" defer></script>
+  <script src="./circles.js" defer></script>
+  <script src="./circles.worker.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="title-block">
+      <h1>Circle of Victory</h1>
+      <p class="lede">Premier League results arranged in a loop: each team beat the next, and the last team beat the first. Pick a season to see its longest loops, built from every result since 1992–93.</p>
+    </div>
+    <div class="controls">
+      <label class="control">
+        <span class="label">Season</span>
+        <select id="season-select"></select>
+      </label>
+      <button id="theme-toggle" class="text-button" type="button">Dark</button>
+    </div>
+  </header>
+
+  <dl id="summary" class="stats" aria-live="polite"></dl>
+  <p id="notice" class="notice" hidden></p>
+
+  <main class="layout">
+    <section class="viewer" aria-label="Circle viewer">
+      <div id="figure" class="figure">
+        <svg id="ring" class="ring" role="img" aria-label="Circle of teams"></svg>
+        <div id="loading" class="loading" hidden>
+          <p id="loading-text" class="loading-text">Loading…</p>
+          <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
+        </div>
+        <p id="empty" class="empty" hidden></p>
+        <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+      </div>
+
+      <nav class="pager" aria-label="Browse circles">
+        <button id="prev" class="square-button" type="button" aria-label="Previous circle">←</button>
+        <span id="counter" class="counter" aria-live="polite">–</span>
+        <button id="next" class="square-button" type="button" aria-label="Next circle">→</button>
+        <button id="random" class="text-button" type="button">Random</button>
+      </nav>
+      <div class="actions">
+        <button id="save-image" class="text-button" type="button">Save image</button>
+        <button id="copy-image" class="text-button" type="button">Copy image</button>
+      </div>
+      <p class="hint">
+        <span class="hint-pointer">Hover over an arrow to see the result. Use ← → to browse.</span>
+        <span class="hint-touch">Tap an arrow to see the result. Swipe the ring to browse.</span>
+      </p>
+    </section>
+
+    <section class="results" aria-labelledby="results-heading">
+      <h2 id="results-heading" class="label">Results behind each arrow</h2>
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th scope="col" class="col-index">#</th>
+            <th scope="col">Winner</th>
+            <th scope="col" class="col-score">Score</th>
+            <th scope="col">Loser</th>
+            <th scope="col" class="col-date">Date</th>
+          </tr>
+        </thead>
+        <tbody id="chain"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <details id="match-list" class="matches">
+    <summary>All matches this season <span id="match-count" class="match-count"></span></summary>
+    <div id="match-groups" class="match-groups"></div>
+  </details>
+
+  <footer class="footer">
+    Results from <a href="https://github.com/openfootball" rel="noopener">openfootball</a>. Crests from <a href="https://en.wikipedia.org/" rel="noopener">Wikipedia</a> and <a href="https://www.thesportsdb.com/" rel="noopener">TheSportsDB</a>. Fetched live on each visit and not stored. H and A mark home and away wins.
+  </footer>
+</body>
+</html>
