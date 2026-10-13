@@ -653,6 +653,14 @@ a:focus-visible {
   .col-date {
     display: none;
   }
+
+  .counter {
+    min-width: 10ch;
+  }
+
+  .pager .text-button {
+    margin-left: 0;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

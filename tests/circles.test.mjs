@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import CircleSearch from "../circles.js";
 
-const { buildAdjacency, canonicalRotation, findLongestCycles, isValidCycle, seededRandom } = CircleSearch;
+const { buildAdjacency, canonicalRotation, findLongestCycles, isValidCycle, openCircleSession, seededRandom } = CircleSearch;
 
 function graphFrom(teamCount, wins) {
   return { teamCount, wins, beats: buildAdjacency(teamCount, wins) };
@@ -125,11 +125,32 @@ test("caps large results, reports it, and stays valid and distinct", () => {
   assertWellFormed(graph, result);
 });
 
-test("capped sampling is deterministic for a fixed seed", () => {
+test("generated circles are valid, longest, canonical and reproducible from their seed", () => {
   const graph = randomGraph(12, 7, 0.6);
-  const first = findLongestCycles(graph.beats, { limit: 50, seed: 99 });
-  const second = findLongestCycles(graph.beats, { limit: 50, seed: 99 });
-  assert.deepEqual(first, second);
+  const session = openCircleSession(graph.beats, { limit: 50 });
+  assert.equal(session.complete, false);
+  const generated = [];
+  for (let seed = 1; seed <= 300; seed++) {
+    const cycle = session.generate(seed);
+    assert.deepEqual(session.generate(seed), cycle, `seed ${seed} must always give the same circle`);
+    generated.push(cycle);
+  }
+  assertWellFormed(graph, { longest: session.longest, cycles: [...new Map(generated.map((cycle) => [cycle.join(","), cycle])).values()] });
+  assert.ok(new Set(generated.map((cycle) => cycle.join(","))).size > 200, "different seeds should give varied circles");
+});
+
+test("a small season is listed exactly instead of generated", () => {
+  const graph = graphFrom(5, [[0, 1], [1, 2], [2, 3], [3, 4], [4, 0], [2, 0]]);
+  const session = openCircleSession(graph.beats);
+  assert.equal(session.complete, true);
+  assert.deepEqual(session.cycles, [[0, 1, 2, 3, 4]]);
+});
+
+test("generating from a season with no circles gives nothing", () => {
+  const graph = graphFrom(3, [[0, 1], [1, 2]]);
+  const session = openCircleSession(graph.beats);
+  assert.equal(session.longest, 0);
+  assert.equal(session.generate(42), null);
 });
 
 test("handles a 22-team season-sized graph", () => {

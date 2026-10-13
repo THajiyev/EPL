@@ -38,7 +38,10 @@
     data: null,
     graph: null,
     circles: [],
-    capped: false,
+    search: null,
+    generative: false,
+    generating: false,
+    seen: new Set(),
     longest: 0,
     visible: [],
     position: 0,
@@ -110,31 +113,60 @@
     return worker;
   }
 
-  function searchOnMainThread(graph) {
-    const result = CircleSearch.findLongestCycles(graph.beats);
-    return { ...result, cycles: result.cycles.filter((cycle) => CircleSearch.isValidCycle(cycle, graph.beats)) };
+  function stopWorker() {
+    if (worker) worker.terminate();
+    worker = null;
   }
 
-  function searchAfterPaint(graph) {
-    return new Promise((resolve) => setTimeout(() => resolve(searchOnMainThread(graph)), 50));
+  function validGenerated(cycle, beats) {
+    return cycle && CircleSearch.isValidCycle(cycle, beats) ? cycle : null;
   }
 
-  function computeCircles(graph, onProgress) {
+  function openSearchOnMainThread(graph) {
+    return new Promise((resolve) =>
+      setTimeout(() => {
+        const session = CircleSearch.openCircleSession(graph.beats);
+        const cycles = session.complete ? session.cycles.filter((cycle) => CircleSearch.isValidCycle(cycle, graph.beats)) : [];
+        const generate = async (seed) => validGenerated(session.generate(seed), graph.beats);
+        resolve({ longest: session.longest, complete: session.complete, cycles, generate });
+      }, 50),
+    );
+  }
+
+  function workerChannel(active, onProgress) {
+    const pending = new Map();
+    active.onmessage = ({ data }) => {
+      if (data.type === "progress") return onProgress(data.phase, data.fraction);
+      const waiting = pending.get(data.requestId);
+      if (!waiting) return;
+      pending.delete(data.requestId);
+      if (data.type === "error") waiting.reject(new Error(data.message));
+      else waiting.resolve(data);
+    };
+    return (message) =>
+      new Promise((resolve, reject) => {
+        const requestId = ++workerRequest;
+        pending.set(requestId, { resolve, reject });
+        active.postMessage({ ...message, requestId });
+      });
+  }
+
+  async function openSearchInWorker(active, graph, onProgress) {
+    const request = workerChannel(active, onProgress);
+    const opened = await request({ type: "open", beats: Array.from(graph.beats) });
+    const generate = async (seed) => (await request({ type: "generate", seed })).cycle;
+    return { longest: opened.longest, complete: opened.complete, cycles: opened.cycles, generate };
+  }
+
+  function openSearch(graph, onProgress) {
     const active = freshWorker();
-    if (!active) return searchAfterPaint(graph);
+    if (!active) return openSearchOnMainThread(graph);
     return new Promise((resolve, reject) => {
-      const requestId = ++workerRequest;
-      active.onmessage = ({ data }) => {
-        if (data.type === "progress") onProgress(data.phase, data.fraction);
-        else if (data.requestId !== requestId) return;
-        else if (data.type === "result") resolve(data);
-        else reject(new Error(data.message));
-      };
       active.onerror = (event) => {
         event.preventDefault();
-        resolve(searchAfterPaint(graph));
+        resolve(openSearchOnMainThread(graph));
       };
-      active.postMessage({ requestId, beats: Array.from(graph.beats) });
+      openSearchInWorker(active, graph, onProgress).then(resolve, reject);
     });
   }
 
@@ -180,11 +212,11 @@
   }
 
   function seasonStats() {
-    const { data, longest, circles, capped } = state;
+    const { data, longest, circles, generative } = state;
     return [
       ["Season", seasonName(data.season)],
       ["Longest circle", longest > 0 ? `${longest} of ${data.teams.length} teams` : "None yet"],
-      ["Circles found", capped ? `${formatCount(circles.length)}+ (sample)` : formatCount(circles.length)],
+      ["Circles found", generative ? "More than 2,000" : formatCount(circles.length)],
       ["Played", `${formatCount(data.played.length)} / ${formatCount(data.scheduled)}`],
     ];
   }
@@ -219,31 +251,39 @@
     return seasonData.get(season);
   }
 
-  async function fetchSeasonResult(season, graph) {
-    if (!seasonResults.has(season)) seasonResults.set(season, await computeCircles(graph, reportSearchProgress));
-    return seasonResults.get(season);
+  async function fetchSeasonSearch(season, graph) {
+    if (seasonResults.has(season)) {
+      stopWorker();
+      return seasonResults.get(season);
+    }
+    const search = await openSearch(graph, reportSearchProgress);
+    if (search.complete) seasonResults.set(season, search);
+    return search;
   }
 
   function resetView() {
     hideTooltip();
     state.circles = [];
+    state.search = null;
+    state.generative = false;
+    state.generating = false;
+    state.seen = new Set();
     state.visible = [];
     state.longest = 0;
-    state.capped = false;
     state.position = 0;
     elements.chain.replaceChildren();
     elements.counter.textContent = "–";
     updatePagerButtons();
   }
 
-  function rememberSeasonInUrl(season) {
-    history.replaceState(null, "", `#${season}`);
+  function rememberInUrl(season, code = null) {
+    history.replaceState(null, "", code ? `#${season}/${code}` : `#${season}`);
   }
 
-  async function selectSeason(season) {
+  async function selectSeason(season, requestedCode = null) {
     const token = ++state.loadToken;
     state.season = season;
-    rememberSeasonInUrl(season);
+    rememberInUrl(season);
     resetView();
     showEmpty(null);
     showNotice([]);
@@ -252,29 +292,30 @@
     try {
       const data = await fetchSeasonData(season);
       if (token !== state.loadToken) return;
-      await showSeason(data, token);
+      await showSeason(data, token, requestedCode);
     } catch (error) {
       if (token !== state.loadToken) return;
       showSeasonError(season, error);
     }
   }
 
-  async function showSeason(data, token) {
+  async function showSeason(data, token, requestedCode) {
     if (data.teams.length > 24) throw new Error("This season has more teams than the search can handle.");
     state.data = data;
     state.graph = buildGraph(data);
     renderMatchList();
     loadCrests(data.teams, rememberCrest);
     setLoading("Searching every subset of teams…", 0);
-    const result = await fetchSeasonResult(data.season, state.graph);
+    const search = await fetchSeasonSearch(data.season, state.graph);
     if (token !== state.loadToken) return;
-    state.circles = toCircles(result.cycles, state.graph);
-    state.longest = state.circles.length ? result.longest : 0;
-    state.capped = result.capped;
+    state.search = search;
+    state.generative = !search.complete;
+    state.circles = toCircles(search.cycles, state.graph);
+    state.longest = state.generative || state.circles.length ? search.longest : 0;
     setLoading(null);
     renderStats(seasonStats());
     showNotice(noticeLines(data));
-    showCircles();
+    await showCircles(codeToSeed(requestedCode));
   }
 
   function showSeasonError(season, error) {
@@ -294,10 +335,58 @@
     ring.setCrest(slug, url);
   }
 
-  function showCircles() {
-    state.visible = state.circles;
+  async function showCircles(requestedSeed) {
     state.position = 0;
-    renderCurrent();
+    if (!state.generative) {
+      state.visible = state.circles;
+      return renderCurrent();
+    }
+    state.visible = [];
+    await appendGenerated(requestedSeed);
+  }
+
+  function randomSeed() {
+    return crypto.getRandomValues(new Uint32Array(1))[0];
+  }
+
+  function seedToCode(seed) {
+    return seed.toString(36);
+  }
+
+  function codeToSeed(code) {
+    if (!code || !/^[0-9a-z]{1,7}$/.test(code)) return null;
+    const seed = parseInt(code, 36);
+    return seed <= 0xffffffff ? seed : null;
+  }
+
+  async function generateFresh(requestedSeed) {
+    const attempts = 24;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const seed = attempt === 0 && requestedSeed !== null ? requestedSeed : randomSeed();
+      const cycle = await state.search.generate(seed);
+      const circle = cycle ? toCircles([cycle], state.graph)[0] : null;
+      if (!circle) continue;
+      const key = circle.slugs.join(",");
+      if (state.seen.has(key) && attempt < attempts - 1) continue;
+      state.seen.add(key);
+      return { ...circle, code: seedToCode(seed) };
+    }
+    return null;
+  }
+
+  async function appendGenerated(requestedSeed = null) {
+    if (state.generating) return;
+    state.generating = true;
+    const token = state.loadToken;
+    try {
+      const circle = await generateFresh(requestedSeed);
+      if (token !== state.loadToken || !circle) return;
+      state.visible.push(circle);
+      state.position = state.visible.length - 1;
+      renderCurrent();
+    } finally {
+      state.generating = false;
+    }
   }
 
   function emptyMessage() {
@@ -318,33 +407,37 @@
       renderChain(circle);
       elements.ring.setAttribute("aria-label", `Circle of ${circle.slugs.length} teams: ${circle.slugs.map(teamName).join(", ")}`);
     }
+    if (state.season) rememberInUrl(state.season, circle?.code);
     renderCounter();
     updatePagerButtons();
   }
 
   function renderCounter() {
     const total = state.visible.length;
-    elements.counter.textContent = total ? `${formatCount(state.position + 1)} / ${formatCount(total)}${state.capped ? "+" : ""}` : "0 / 0";
+    if (state.generative) elements.counter.textContent = total ? `Circle ${formatCount(state.position + 1)}` : "–";
+    else elements.counter.textContent = total ? `${formatCount(state.position + 1)} / ${formatCount(total)}` : "0 / 0";
   }
 
   function updatePagerButtons() {
-    const browsable = state.visible.length > 1;
-    elements.prev.disabled = !browsable;
+    const hasCircle = Boolean(state.visible[state.position]);
+    const browsable = state.generative ? hasCircle : state.visible.length > 1;
+    elements.prev.disabled = state.generative ? state.position === 0 : !browsable;
     elements.next.disabled = !browsable;
     elements.random.disabled = !browsable;
-    const hasCircle = Boolean(state.visible[state.position]);
+    elements.random.textContent = state.generative ? "New circle" : "Random";
     elements.saveImage.disabled = !hasCircle;
     elements.copyImage.disabled = !hasCircle;
   }
 
   function imageDetails() {
-    const total = `${formatCount(state.visible.length)}${state.capped ? "+" : ""}`;
     const circle = state.visible[state.position];
+    const label = circle.code ? circle.code : `${formatCount(state.position + 1)} of ${formatCount(state.visible.length)}`;
     const pageUrl = /^https?:$/.test(location.protocol) ? location.origin + location.pathname : "";
+    const link = pageUrl && circle.code ? `${pageUrl}#${state.data.season}/${circle.code}` : pageUrl;
     return {
-      subtitle: `${seasonName(state.data.season)} · ${circle.slugs.length} of ${state.data.teams.length} teams · circle ${formatCount(state.position + 1)} of ${total}`,
-      footer: pageUrl || "Results: openfootball · Crests: Wikipedia",
-      fileName: `circle-of-victory-${state.data.season}-${state.position + 1}.png`,
+      subtitle: `${seasonName(state.data.season)} · ${circle.slugs.length} of ${state.data.teams.length} teams · circle ${label}`,
+      footer: link || "Results: openfootball · Crests: Wikipedia",
+      fileName: `circle-of-victory-${state.data.season}-${circle.code ?? state.position + 1}.png`,
     };
   }
 
@@ -352,12 +445,12 @@
     return renderCircleImage(state.visible[state.position], crestUrls, imageDetails());
   }
 
-  function flashButton(button, message) {
+  function flashButton(button, message, { sticky = false } = {}) {
     const original = button.dataset.label ?? button.textContent;
     button.dataset.label = original;
     button.textContent = message;
     clearTimeout(Number(button.dataset.timer));
-    button.dataset.timer = String(setTimeout(() => (button.textContent = original), 2000));
+    if (!sticky) button.dataset.timer = String(setTimeout(() => (button.textContent = original), 2000));
   }
 
   function downloadBlob(blob, fileName) {
@@ -389,7 +482,7 @@
   async function saveImage() {
     if (!state.visible[state.position]) return;
     const { fileName } = imageDetails();
-    flashButton(elements.saveImage, "Drawing…");
+    flashButton(elements.saveImage, "Drawing…", { sticky: true });
     try {
       const blob = await currentImage();
       if (prefersShareSheet() && (await shareFile(blob, fileName))) return flashButton(elements.saveImage, "Shared");
@@ -406,7 +499,7 @@
 
   async function copyImage() {
     if (!state.visible[state.position]) return;
-    flashButton(elements.copyImage, "Drawing…");
+    flashButton(elements.copyImage, "Drawing…", { sticky: true });
     try {
       await navigator.clipboard.write([new ClipboardItem({ "image/png": currentImage() })]);
       flashButton(elements.copyImage, "Copied");
@@ -450,7 +543,16 @@
     elements.chain.querySelectorAll("tr").forEach((row) => row.classList.toggle("is-active", row.dataset.index === String(index)));
   }
 
+  function stepThroughHistory(offset) {
+    const target = state.position + offset;
+    if (target < 0) return;
+    if (target >= state.visible.length) return appendGenerated();
+    state.position = target;
+    renderCurrent();
+  }
+
   function step(offset) {
+    if (state.generative) return stepThroughHistory(offset);
     const total = state.visible.length;
     if (total < 2) return;
     state.position = (state.position + offset + total) % total;
@@ -458,6 +560,7 @@
   }
 
   function jumpRandom() {
+    if (state.generative) return appendGenerated();
     const total = state.visible.length;
     if (total < 2) return;
     const pick = Math.floor(Math.random() * (total - 1));
@@ -613,10 +716,10 @@
     labelThemeToggle();
   }
 
-  function initialSeason() {
-    const fromUrl = decodeURIComponent(location.hash.slice(1));
+  function initialLocation() {
+    const [season, code = null] = decodeURIComponent(location.hash.slice(1)).split("/");
     const seasons = listSeasons();
-    return seasons.includes(fromUrl) ? fromUrl : seasons[0];
+    return seasons.includes(season) ? { season, code } : { season: seasons[0], code: null };
   }
 
   function bindEvents() {
@@ -639,9 +742,9 @@
     labelThemeToggle();
     elements.copyImage.hidden = !canCopyImages();
     bindEvents();
-    const season = initialSeason();
+    const { season, code } = initialLocation();
     elements.seasonSelect.value = season;
-    selectSeason(season);
+    selectSeason(season, code);
   }
 
   start();

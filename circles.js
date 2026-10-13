@@ -150,17 +150,10 @@ function createCircleSearch() {
     return reversed.reverse();
   }
 
-  function sampleCycles(table, masks, limit, seed = 20240813) {
+  function generateCycle(table, masks, seed) {
     const random = seededRandom(seed);
-    const seen = new Map();
-    const maxAttempts = limit * 40;
-    for (let attempt = 0; attempt < maxAttempts && seen.size < limit; attempt++) {
-      const mask = masks[Math.floor(random() * masks.length)];
-      const cycle = walkBackRandomly(table, mask, random);
-      const key = cycle.join(",");
-      if (!seen.has(key)) seen.set(key, cycle);
-    }
-    return [...seen.values()];
+    const mask = masks[Math.floor(random() * masks.length)];
+    return walkBackRandomly(table, mask, random);
   }
 
   function canonicalRotation(cycle) {
@@ -180,19 +173,23 @@ function createCircleSearch() {
     });
   }
 
-  function findLongestCycles(beats, { limit = CYCLE_CAP, seed, onProgress = () => {} } = {}) {
+  function openCircleSession(beats, { limit = CYCLE_CAP, onProgress = () => {} } = {}) {
     if (beats.length > 24) throw new Error("Too many teams for the bitmask search");
     const table = buildPathTable(beats, (fraction) => onProgress("search", fraction));
-    if (table.longest === 0) return { longest: 0, cycles: [], capped: false };
+    if (table.longest === 0) return { longest: 0, cycles: [], complete: true, generate: () => null };
     onProgress("collect", 0);
     const masks = cycleMasksOfLength(table, table.longest);
-    const exhaustive = collectAllCycles(table, masks, limit);
-    const cycles = exhaustive.complete ? exhaustive.cycles : sampleCycles(table, masks, limit, seed);
+    const { cycles, complete } = collectAllCycles(table, masks, limit);
     onProgress("collect", 1);
-    return { longest: table.longest, cycles, capped: !exhaustive.complete };
+    return { longest: table.longest, cycles, complete, generate: (seed) => generateCycle(table, masks, seed) };
   }
 
-  return { CYCLE_CAP, MIN_CYCLE_LENGTH, bitCount, lowestBitIndex, bitIndices, buildAdjacency, invertAdjacency, buildPathTable, cycleMasksOfLength, collectAllCycles, seededRandom, sampleCycles, canonicalRotation, isValidCycle, findLongestCycles };
+  function findLongestCycles(beats, options = {}) {
+    const { longest, cycles, complete } = openCircleSession(beats, options);
+    return { longest, cycles, capped: !complete };
+  }
+
+  return { CYCLE_CAP, MIN_CYCLE_LENGTH, bitCount, lowestBitIndex, bitIndices, buildAdjacency, invertAdjacency, buildPathTable, cycleMasksOfLength, collectAllCycles, seededRandom, generateCycle, canonicalRotation, isValidCycle, openCircleSession, findLongestCycles };
 }
 
 const CircleSearch = createCircleSearch();
