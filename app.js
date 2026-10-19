@@ -1,5 +1,5 @@
 (() => {
-  const { listSeasons, loadSeason, winsOf } = CircleMatches;
+  const { listSeasons, loadSeason, hasNewResults, winsOf } = CircleMatches;
   const { loadCrests } = CircleCrests;
   const { createRing } = CircleRing;
   const { renderCircleImage } = CircleSnapshot;
@@ -32,6 +32,8 @@
   const seasonData = new Map();
   const seasonResults = new Map();
   const crestUrls = new Map();
+  const lastFreshnessCheck = new Map();
+  const FRESHNESS_CHECK_MS = 60 * 1000;
 
   const state = {
     season: null,
@@ -87,15 +89,30 @@
     return cycleEdges(slugs).every(({ from, to }) => (graph.evidence.get(edgeKey(from, to)) ?? []).length > 0);
   }
 
+  function circleForSlugs(slugs, graph) {
+    if (!slugs.every(Boolean) || !isBackedCycle(slugs, graph)) return null;
+    const edges = cycleEdges(slugs).map((edge) => ({ ...edge, matches: graph.evidence.get(edgeKey(edge.from, edge.to)) }));
+    return { slugs, edges };
+  }
+
   function toCircles(cycles, graph) {
-    const circles = [];
-    for (const cycle of cycles) {
-      const slugs = cycle.map((index) => graph.teams[index]);
-      if (!slugs.every(Boolean) || !isBackedCycle(slugs, graph)) continue;
-      const edges = cycleEdges(slugs).map((edge) => ({ ...edge, matches: graph.evidence.get(edgeKey(edge.from, edge.to)) }));
-      circles.push({ slugs, edges });
-    }
-    return circles;
+    return cycles.map((cycle) => circleForSlugs(cycle.map((index) => graph.teams[index]), graph)).filter(Boolean);
+  }
+
+  function rotationKey(slugs) {
+    const start = slugs.indexOf([...slugs].sort()[0]);
+    return [...slugs.slice(start), ...slugs.slice(0, start)].join(",");
+  }
+
+  function circleLink(slugs) {
+    return slugs.map((slug) => CircleTeams.clubFor(slug).code).join("-");
+  }
+
+  function slugsFromLink(link, teams) {
+    if (!link?.includes("-")) return null;
+    const slugByCode = new Map(teams.map((slug) => [CircleTeams.clubFor(slug).code, slug]));
+    const slugs = link.toUpperCase().split("-").map((code) => slugByCode.get(code));
+    return slugs.every(Boolean) ? slugs : null;
   }
 
   function workerScriptUrl() {
@@ -240,8 +257,29 @@
     }
   }
 
-  function fetchSeasonData(season) {
+  async function dropIfStale(season) {
+    const cached = seasonData.get(season);
+    const now = Date.now();
+    if (!cached || now - (lastFreshnessCheck.get(season) ?? 0) < FRESHNESS_CHECK_MS) return false;
+    lastFreshnessCheck.set(season, now);
+    const data = await cached.catch(() => null);
+    if (!data || seasonData.get(season) !== cached || !(await hasNewResults(data))) return false;
+    seasonData.delete(season);
+    seasonResults.delete(season);
+    return true;
+  }
+
+  async function refreshIfStale() {
+    const season = state.season;
+    if (document.hidden || state.data?.season !== season) return;
+    const viewing = state.visible[state.position];
+    if ((await dropIfStale(season)) && state.season === season) selectSeason(season, viewing ? circleLink(viewing.slugs) : null, true);
+  }
+
+  async function fetchSeasonData(season) {
+    await dropIfStale(season);
     if (!seasonData.has(season)) {
+      lastFreshnessCheck.set(season, Date.now());
       const request = loadSeason(season).catch((error) => {
         seasonData.delete(season);
         throw error;
@@ -280,7 +318,7 @@
     history.replaceState(null, "", code ? `#${season}/${code}` : `#${season}`);
   }
 
-  async function selectSeason(season, requestedCode = null) {
+  async function selectSeason(season, requestedCode = null, refreshed = false) {
     const token = ++state.loadToken;
     state.season = season;
     rememberInUrl(season);
@@ -292,14 +330,20 @@
     try {
       const data = await fetchSeasonData(season);
       if (token !== state.loadToken) return;
-      await showSeason(data, token, requestedCode);
+      await showSeason(data, token, requestedCode, refreshed);
     } catch (error) {
       if (token !== state.loadToken) return;
       showSeasonError(season, error);
     }
   }
 
-  async function showSeason(data, token, requestedCode) {
+  function circleNotice(kept, refreshed) {
+    const lines = refreshed ? ["Updated with the latest results."] : [];
+    if (!kept) lines.push(refreshed ? "The circle you were viewing is no longer one of the longest, so here is another." : "The circle in this link is no longer one of the longest this season, so here is another.");
+    return lines;
+  }
+
+  async function showSeason(data, token, requestedCode, refreshed) {
     if (data.teams.length > 24) throw new Error("This season has more teams than the search can handle.");
     state.data = data;
     state.graph = buildGraph(data);
@@ -315,7 +359,8 @@
     setLoading(null);
     renderStats(seasonStats());
     showNotice(noticeLines(data));
-    await showCircles(codeToSeed(requestedCode));
+    const kept = await showCircles(requestedCode);
+    if (token === state.loadToken) showNotice([...circleNotice(kept, refreshed), ...noticeLines(data)]);
   }
 
   function showSeasonError(season, error) {
@@ -335,22 +380,30 @@
     ring.setCrest(slug, url);
   }
 
-  async function showCircles(requestedSeed) {
+  async function showCircles(requested) {
     state.position = 0;
+    const wanted = slugsFromLink(requested, state.data.teams);
     if (!state.generative) {
       state.visible = state.circles;
-      return renderCurrent();
+      const index = wanted ? state.circles.findIndex((circle) => rotationKey(circle.slugs) === rotationKey(wanted)) : -1;
+      state.position = Math.max(index, 0);
+      renderCurrent();
+      return !wanted || index >= 0;
     }
     state.visible = [];
-    await appendGenerated(requestedSeed);
+    const kept = wanted?.length === state.longest ? circleForSlugs(wanted, state.graph) : null;
+    if (!kept) {
+      await appendGenerated(codeToSeed(requested));
+      return !wanted;
+    }
+    state.seen.add(rotationKey(kept.slugs));
+    state.visible.push(kept);
+    renderCurrent();
+    return true;
   }
 
   function randomSeed() {
     return crypto.getRandomValues(new Uint32Array(1))[0];
-  }
-
-  function seedToCode(seed) {
-    return seed.toString(36);
   }
 
   function codeToSeed(code) {
@@ -366,10 +419,10 @@
       const cycle = await state.search.generate(seed);
       const circle = cycle ? toCircles([cycle], state.graph)[0] : null;
       if (!circle) continue;
-      const key = circle.slugs.join(",");
+      const key = rotationKey(circle.slugs);
       if (state.seen.has(key) && attempt < attempts - 1) continue;
       state.seen.add(key);
-      return { ...circle, code: seedToCode(seed) };
+      return circle;
     }
     return null;
   }
@@ -407,7 +460,7 @@
       renderChain(circle);
       elements.ring.setAttribute("aria-label", `Circle of ${circle.slugs.length} teams: ${circle.slugs.map(teamName).join(", ")}`);
     }
-    if (state.season) rememberInUrl(state.season, circle?.code);
+    if (state.season) rememberInUrl(state.season, circle ? circleLink(circle.slugs) : null);
     renderCounter();
     updatePagerButtons();
   }
@@ -431,13 +484,13 @@
 
   function imageDetails() {
     const circle = state.visible[state.position];
-    const label = circle.code ? circle.code : `${formatCount(state.position + 1)} of ${formatCount(state.visible.length)}`;
+    const label = state.generative ? "" : ` · circle ${formatCount(state.position + 1)} of ${formatCount(state.visible.length)}`;
     const pageUrl = /^https?:$/.test(location.protocol) ? location.origin + location.pathname : "";
-    const link = pageUrl && circle.code ? `${pageUrl}#${state.data.season}/${circle.code}` : pageUrl;
+    const link = pageUrl && `${pageUrl}#${state.data.season}/${circleLink(circle.slugs)}`;
     return {
-      subtitle: `${seasonName(state.data.season)} · ${circle.slugs.length} of ${state.data.teams.length} teams · circle ${label}`,
-      footer: link || "Results: openfootball · Crests: Wikipedia",
-      fileName: `circle-of-victory-${state.data.season}-${circle.code ?? state.position + 1}.png`,
+      subtitle: `${seasonName(state.data.season)} · ${circle.slugs.length} of ${state.data.teams.length} teams${label}`,
+      footer: link || "Results: openfootball · ESPN · Crests: Wikipedia",
+      fileName: `circle-of-victory-${state.data.season}-${state.position + 1}.png`,
     };
   }
 
@@ -732,6 +785,7 @@
     elements.themeToggle.addEventListener("click", toggleTheme);
     elements.matchList.addEventListener("toggle", fillMatchList);
     document.addEventListener("keydown", handleKeys);
+    document.addEventListener("visibilitychange", refreshIfStale);
     document.addEventListener("click", () => state.pinnedEdge !== null && hideTooltip());
     window.addEventListener("resize", () => !elements.tooltip.hidden && hideTooltip());
     enableSwipe(elements.figure);

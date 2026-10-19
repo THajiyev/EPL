@@ -92,9 +92,9 @@ const CircleMatches = (() => {
     return { played, scheduled: played.length, fixtureTeams: new Set(played.flatMap((match) => [match.home, match.away])) };
   }
 
-  async function fetchOrNull(url, read) {
+  async function fetchOrNull(url, read, options) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, options);
       if (!response.ok) return null;
       return await read(response);
     } catch {
@@ -141,7 +141,7 @@ const CircleMatches = (() => {
     const worker = async () => {
       while (next < days.length) {
         const day = days[next++];
-        const data = await fetchOrNull(ESPN_SOURCE(day), (response) => response.json());
+        const data = await fetchOrNull(ESPN_SOURCE(day), (response) => response.json(), { cache: "no-cache" });
         if (data) results.push(...parseEspnDay(data));
       }
     };
@@ -153,10 +153,23 @@ const CircleMatches = (() => {
     return isoDate(today.getFullYear(), today.getMonth(), today.getDate());
   }
 
+  function latestPlayedDate(played, season) {
+    return played.reduce((latest, match) => (match.date > latest ? match.date : latest), `${season.slice(0, 4)}-08-01`);
+  }
+
+  function isCurrentSeason(season, today) {
+    return season === seasonLabel(currentSeasonStart(today));
+  }
+
+  async function hasNewResults(data, today = new Date()) {
+    if (!isCurrentSeason(data.season, today)) return false;
+    const recent = await fetchEspnDays(daysBetween(latestPlayedDate(data.played, data.season), localIsoDate(today)));
+    const known = new Set(data.played.map((match) => `${match.home}>${match.away}`));
+    return recent.some((result) => !known.has(`${slugForTeam(result.home)}>${slugForTeam(result.away)}`));
+  }
+
   async function addRecentEspnResults(raw, season, today) {
-    const seasonStart = `${season.slice(0, 4)}-08-01`;
-    const lastKnown = raw.played.reduce((latest, match) => (match.date > latest ? match.date : latest), seasonStart);
-    const recent = await fetchEspnDays(daysBetween(lastKnown, localIsoDate(today)));
+    const recent = await fetchEspnDays(daysBetween(latestPlayedDate(raw.played, season), localIsoDate(today)));
     const known = new Set(raw.played.map((match) => `${match.home}>${match.away}`));
     const added = [];
     for (const result of recent) {
@@ -200,7 +213,7 @@ const CircleMatches = (() => {
   }
 
   async function loadSeason(season, today = new Date()) {
-    const isCurrent = season === seasonLabel(currentSeasonStart(today));
+    const isCurrent = isCurrentSeason(season, today);
     const fetched = await fetchSeasonSource(season);
     if (!fetched) throw new Error(`No match data could be fetched for ${season}.`);
     const raw = isCurrent ? await addRecentEspnResults(fetched, season, today) : fetched;
@@ -224,5 +237,5 @@ const CircleMatches = (() => {
     return null;
   }
 
-  return { seasonLabel, currentSeasonStart, listSeasons, checkSeason, loadSeason, winsOf };
+  return { seasonLabel, currentSeasonStart, listSeasons, checkSeason, loadSeason, hasNewResults, winsOf };
 })();
