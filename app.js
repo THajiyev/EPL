@@ -104,15 +104,36 @@
     return [...slugs.slice(start), ...slugs.slice(0, start)].join(",");
   }
 
-  function circleLink(slugs) {
-    return slugs.map((slug) => CircleTeams.clubFor(slug).code).join("-");
+  const LINK_OFFSET = 36n ** 7n;
+
+  function circleLink(slugs, teams) {
+    const order = rotationKey(slugs).split(",").map((slug) => teams.indexOf(slug));
+    const available = teams.map((_, index) => index);
+    let value = 0n;
+    for (const index of order) {
+      const position = available.indexOf(index);
+      value = value * BigInt(available.length) + BigInt(position);
+      available.splice(position, 1);
+    }
+    value = value * BigInt(teams.length + 1) + BigInt(order.length);
+    return (value + LINK_OFFSET).toString(36);
   }
 
   function slugsFromLink(link, teams) {
-    if (!link?.includes("-")) return null;
-    const slugByCode = new Map(teams.map((slug) => [CircleTeams.clubFor(slug).code, slug]));
-    const slugs = link.toUpperCase().split("-").map((code) => slugByCode.get(code));
-    return slugs.every(Boolean) ? slugs : null;
+    if (!link || !/^[0-9a-z]{8,16}$/.test(link)) return null;
+    let value = [...link].reduce((total, digit) => total * 36n + BigInt(parseInt(digit, 36)), 0n) - LINK_OFFSET;
+    const length = Number(value % BigInt(teams.length + 1));
+    value /= BigInt(teams.length + 1);
+    if (value < 0n || length < 3 || length > teams.length) return null;
+    const positions = [];
+    for (let step = length - 1; step >= 0; step--) {
+      const radix = BigInt(teams.length - step);
+      positions[step] = Number(value % radix);
+      value /= radix;
+    }
+    if (value !== 0n) return null;
+    const available = [...teams];
+    return positions.map((position) => available.splice(position, 1)[0]);
   }
 
   function workerScriptUrl() {
@@ -273,7 +294,7 @@
     const season = state.season;
     if (document.hidden || state.data?.season !== season) return;
     const viewing = state.visible[state.position];
-    if ((await dropIfStale(season)) && state.season === season) selectSeason(season, viewing ? circleLink(viewing.slugs) : null, true);
+    if ((await dropIfStale(season)) && state.season === season) selectSeason(season, viewing ? circleLink(viewing.slugs, state.data.teams) : null, true);
   }
 
   async function fetchSeasonData(season) {
@@ -460,7 +481,7 @@
       renderChain(circle);
       elements.ring.setAttribute("aria-label", `Circle of ${circle.slugs.length} teams: ${circle.slugs.map(teamName).join(", ")}`);
     }
-    if (state.season) rememberInUrl(state.season, circle ? circleLink(circle.slugs) : null);
+    if (state.season) rememberInUrl(state.season, circle && state.data ? circleLink(circle.slugs, state.data.teams) : null);
     renderCounter();
     updatePagerButtons();
   }
@@ -486,7 +507,7 @@
     const circle = state.visible[state.position];
     const label = state.generative ? "" : ` · circle ${formatCount(state.position + 1)} of ${formatCount(state.visible.length)}`;
     const pageUrl = /^https?:$/.test(location.protocol) ? location.origin + location.pathname : "";
-    const link = pageUrl && `${pageUrl}#${state.data.season}/${circleLink(circle.slugs)}`;
+    const link = pageUrl && `${pageUrl}#${state.data.season}/${circleLink(circle.slugs, state.data.teams)}`;
     return {
       subtitle: `${seasonName(state.data.season)} · ${circle.slugs.length} of ${state.data.teams.length} teams${label}`,
       footer: link || "Results: openfootball · ESPN · Crests: Wikipedia",
