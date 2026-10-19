@@ -8,6 +8,9 @@ const CircleMatches = (() => {
     const folder = startYear < 2000 ? `archive/1990s/${season}` : season;
     return `https://raw.githubusercontent.com/openfootball/england/master/${folder}/1-premierleague.txt`;
   };
+  const ESPN_SOURCE = (day) => `https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard?dates=${day.replace(/-/g, "")}`;
+  const ESPN_CONCURRENCY = 6;
+  const ESPN_ID_OFFSET = 10000;
   const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
   const DATE_LINE = /^\s*\[?(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:\s+(\d{4}))?\]?\s*$/i;
   const MATCH_LINE = /^\s*(?:\d{1,2}[:.]\d{2}\s+)?(\S.*?)\s+(\d+)\s*-\s*(\d+)(?:\s*\(\d+\s*-\s*\d+\))?\s+(\S.*?)\s*$/;
@@ -110,6 +113,63 @@ const CircleMatches = (() => {
     return null;
   }
 
+  function daysBetween(fromIso, toIso) {
+    const days = [];
+    const cursor = new Date(`${fromIso}T00:00:00Z`);
+    const end = new Date(`${toIso}T00:00:00Z`);
+    for (; cursor <= end; cursor.setUTCDate(cursor.getUTCDate() + 1)) days.push(cursor.toISOString().slice(0, 10));
+    return days;
+  }
+
+  function parseEspnDay(data) {
+    const results = [];
+    for (const event of Array.isArray(data?.events) ? data.events : []) {
+      if (!event.status?.type?.completed) continue;
+      const sides = event.competitions?.[0]?.competitors ?? [];
+      const home = sides.find((side) => side.homeAway === "home");
+      const away = sides.find((side) => side.homeAway === "away");
+      const score = [Number(home?.score), Number(away?.score)];
+      if (!home?.team?.displayName || !away?.team?.displayName || !isRealScore(score)) continue;
+      results.push({ date: String(event.date).slice(0, 10), home: home.team.displayName, away: away.team.displayName, score });
+    }
+    return results;
+  }
+
+  async function fetchEspnDays(days) {
+    const results = [];
+    let next = 0;
+    const worker = async () => {
+      while (next < days.length) {
+        const day = days[next++];
+        const data = await fetchOrNull(ESPN_SOURCE(day), (response) => response.json());
+        if (data) results.push(...parseEspnDay(data));
+      }
+    };
+    await Promise.all(Array.from({ length: ESPN_CONCURRENCY }, worker));
+    return results;
+  }
+
+  function localIsoDate(today) {
+    return isoDate(today.getFullYear(), today.getMonth(), today.getDate());
+  }
+
+  async function addRecentEspnResults(raw, season, today) {
+    const seasonStart = `${season.slice(0, 4)}-08-01`;
+    const lastKnown = raw.played.reduce((latest, match) => (match.date > latest ? match.date : latest), seasonStart);
+    const recent = await fetchEspnDays(daysBetween(lastKnown, localIsoDate(today)));
+    const known = new Set(raw.played.map((match) => `${match.home}>${match.away}`));
+    const added = [];
+    for (const result of recent) {
+      const match = buildMatch(ESPN_ID_OFFSET + added.length, result.date, result.home, result.away, result.score);
+      const key = `${match.home}>${match.away}`;
+      if (known.has(key)) continue;
+      known.add(key);
+      added.push(match);
+    }
+    if (added.length === 0) return raw;
+    return { ...raw, played: [...raw.played, ...added], source: `${raw.source} + ESPN` };
+  }
+
   function sortedTeams(fixtureTeams, played) {
     const all = new Set(fixtureTeams);
     played.forEach((match) => all.add(match.home).add(match.away));
@@ -140,10 +200,11 @@ const CircleMatches = (() => {
   }
 
   async function loadSeason(season, today = new Date()) {
-    const raw = await fetchSeasonSource(season);
-    if (!raw) throw new Error(`No match data could be fetched for ${season}.`);
-    const teams = sortedTeams(raw.fixtureTeams, raw.played);
     const isCurrent = season === seasonLabel(currentSeasonStart(today));
+    const fetched = await fetchSeasonSource(season);
+    if (!fetched) throw new Error(`No match data could be fetched for ${season}.`);
+    const raw = isCurrent ? await addRecentEspnResults(fetched, season, today) : fetched;
+    const teams = sortedTeams(raw.fixtureTeams, raw.played);
     const inProgress = isCurrent || raw.played.length < raw.scheduled;
     const played = raw.played.filter((match) => match.home !== match.away);
     return {
